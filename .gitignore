@@ -1,0 +1,25 @@
+# Recordings, audio and anything derived from a meeting
+recordings/
+input/*
+output/*
+exports/
+!input/.gitkeep
+!output/.gitkeep
+
+# Voice profiles are biometric data — never commit these
+speakers.json
+
+# Environment and caches
+.venv/
+.cache/
+models/
+__pycache__/
+*.py[cod]
+
+# Runtime
+server.log
+.server.pid
+backup/
+
+# macOS
+.DS_Store
