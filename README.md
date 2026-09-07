@@ -137,7 +137,7 @@ Requires an Apple Silicon Mac, Python 3.11, and Homebrew FFmpeg.
 
 ```bash
 brew install ffmpeg
-git clone https://github.com/<you>/threadmark.git
+git clone https://github.com/tanueihorng/threadmark.git
 cd threadmark
 python3.11 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
