@@ -25,7 +25,7 @@ from pydantic import BaseModel
 import accuracy
 import meeting_context
 import power
-from audio_timeline import CHUNK_SECONDS, build_recording
+from audio_timeline import CHUNK_SECONDS, TARGET_RATE, build_recording
 from speaker_memory import SpeakerMemory
 
 ROOT = Path(__file__).resolve().parent
@@ -38,6 +38,7 @@ FINAL_MODELS = {
 }
 REFINE_MODEL = os.environ.get("THREADMARK_REFINE_MODEL", "")
 LIVE_CONTEXT_SECONDS = 1.0
+HALLUCINATION_SILENCE = 2.0
 
 os.environ.setdefault("HF_HOME", str(ROOT / ".cache" / "huggingface"))
 os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "0")
@@ -104,13 +105,36 @@ def manifest_path(state: SessionState) -> Path:
     return state.directory / "manifest.json"
 
 
+# The transcript, review queue and voice embeddings are large — a one-hour
+# meeting runs to tens of megabytes — and they are already written verbatim to
+# transcript.json when a session completes. Keeping them out of the manifest
+# turns every progress update from a multi-megabyte rewrite into a small one.
+HEAVY_FIELDS = ("result", "review", "refinement", "quality", "speakers")
+
+
 def save_state(state: SessionState) -> None:
     with STATE_LOCK:
-        payload = asdict(state)
+        payload = {
+            key: value for key, value in asdict(state).items() if key not in HEAVY_FIELDS
+        }
         payload["directory"] = state.directory.name
         temp = state.directory / "manifest.tmp"
         temp.write_text(json.dumps(payload, indent=2, default=json_default) + "\n", encoding="utf-8")
         temp.replace(manifest_path(state))
+
+
+def _restore_heavy(state: SessionState) -> None:
+    """Bring the transcript back from the file that already holds it."""
+    path = state.directory / "transcript.json"
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    state.result = stored.get("segments") or state.result
+    state.review = stored.get("review") or state.review
+    state.refinement = stored.get("refinement") or state.refinement
+    state.quality = stored.get("quality") or state.quality
+    state.speakers = stored.get("speakers") or state.speakers
 
 
 def load_sessions() -> None:
@@ -120,15 +144,21 @@ def load_sessions() -> None:
             payload = json.loads(path.read_text(encoding="utf-8"))
             payload["directory"] = path.parent
             state = SessionState(**{key: value for key, value in payload.items() if key in known})
-            if state.status in {"recording", "queued", "finalizing"}:
+            interrupted = state.status in {"recording", "queued", "finalizing"}
+            if interrupted:
                 state.status = "interrupted"
                 state.stage = "Recording recovered — ready to finalize"
                 for chunk in state.chunks:
                     if chunk.get("status") in {"queued", "transcribing"}:
                         chunk["status"] = "skipped"
                         chunk["error"] = "Live preview skipped after restart; final audio is intact"
+            if state.status == "complete" and not state.result:
+                _restore_heavy(state)
             SESSIONS[state.session_id] = state
-            save_state(state)
+            # Only a session whose status actually changed needs rewriting;
+            # otherwise starting the server rewrote every past meeting.
+            if interrupted or any(key in payload for key in HEAVY_FIELDS):
+                save_state(state)
         except (OSError, TypeError, ValueError):
             continue
 
@@ -200,18 +230,89 @@ def vocabulary_terms(state: SessionState) -> dict[str, Any]:
     return accuracy.parse_vocabulary(state.vocabulary)
 
 
+def live_language(state: SessionState) -> str | None:
+    """On auto-detect, let the whole meeting outvote its first thirty seconds.
+
+    Whisper picks a language from the opening 30 s of whatever it is given. The
+    live pass has already sampled the entire meeting six seconds at a time, so a
+    clear majority there is better evidence than the opening alone.
+    """
+    votes: dict[str, int] = {}
+    for chunk in state.chunks:
+        if chunk.get("status") == "ready" and chunk.get("text") and chunk.get("language"):
+            votes[chunk["language"]] = votes.get(chunk["language"], 0) + 1
+    total = sum(votes.values())
+    if total < 3:
+        return None
+    language, count = max(votes.items(), key=lambda item: item[1])
+    return language if count / total >= 0.6 else None
+
+
 # --------------------------------------------------------------------------- #
 # Live preview
 # --------------------------------------------------------------------------- #
 
-def transcribe(path: Path, language: str | None, model: str, **options: Any) -> dict[str, Any]:
+def transcribe(source: Any, language: str | None, model: str, **options: Any) -> dict[str, Any]:
+    """Run Whisper on a file path or on samples already in memory."""
     import mlx_whisper
 
     with MODEL_LOCK:
         return mlx_whisper.transcribe(
-            str(path), path_or_hf_repo=model, word_timestamps=True,
+            str(source) if isinstance(source, Path) else source,
+            path_or_hf_repo=model, word_timestamps=True,
             language=language, verbose=None, **options,
         )
+
+
+def load_pcm(path: Path) -> Any:
+    """Read a 16 kHz mono WAV into the float32 array Whisper wants.
+
+    Passing a path makes mlx-whisper shell out to ffmpeg and recompute the mel
+    spectrogram of the *whole* recording on every call, so re-checking a
+    twelve-second passage costs as much as the meeting is long. Reading the
+    samples once and slicing them makes each window cost what it should.
+    """
+    import numpy as np
+
+    with wave.open(str(path), "rb") as reader:
+        if reader.getsampwidth() != 2:
+            raise RuntimeError("The assembled recording is not 16-bit PCM")
+        frames = reader.readframes(reader.getnframes())
+        channels = reader.getnchannels()
+    samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    return samples
+
+
+def shift_timestamps(result: dict[str, Any], offset: float) -> dict[str, Any]:
+    """Move a clip-relative transcription back onto the recording's timeline."""
+    if not offset:
+        return result
+    for segment in result.get("segments", []):
+        segment["start"] = float(segment.get("start", 0.0)) + offset
+        segment["end"] = float(segment.get("end", 0.0)) + offset
+        for word in segment.get("words", []):
+            word["start"] = float(word["start"]) + offset
+            word["end"] = float(word["end"]) + offset
+    return result
+
+
+def release_whisper() -> None:
+    """Drop the resident Whisper weights before pyannote asks for memory.
+
+    mlx-whisper holds the last model it loaded in a module-level cache, so
+    clearing MLX's buffer cache alone leaves several gigabytes pinned — which is
+    the difference between finishing and swapping on an 8 GB machine.
+    """
+    import mlx.core as mx
+    from mlx_whisper.transcribe import ModelHolder
+
+    with MODEL_LOCK:
+        ModelHolder.model = None
+        ModelHolder.model_path = None
+    mx.clear_cache()
+    gc.collect()
 
 
 def _join_wav(previous: Path, current: Path, destination: Path, seconds: float) -> float:
@@ -315,13 +416,49 @@ async def upload_chunk(
 # Speaker alignment
 # --------------------------------------------------------------------------- #
 
-def choose_speaker(start: float, end: float, turns: list[dict[str, Any]]) -> tuple[str, float]:
+NEAR_TURN = 1.0
+TIMELINE_BIN = 2.0
+# A one-word flip between two runs of the same voice is an alignment artefact,
+# not a real interjection; leaving them in shreds a conversation into fragments.
+SMOOTH_MAX_WORDS = 2
+SMOOTH_MAX_SECONDS = 0.9
+
+
+class SpeakerTimeline:
+    """Time-bucketed speaker turns, so word lookup does not scan them all.
+
+    An hour of conversation is tens of thousands of words against thousands of
+    turns; comparing every pair is minutes of pure Python. Bucketing by time
+    makes each lookup touch only the handful of turns that could possibly match.
+    """
+
+    def __init__(self, turns: list[dict[str, Any]]) -> None:
+        self.turns = turns
+        self.buckets: dict[int, list[int]] = {}
+        for position, turn in enumerate(turns):
+            first = int(max(0.0, turn["start"]) // TIMELINE_BIN)
+            last = int(max(0.0, turn["end"]) // TIMELINE_BIN)
+            for bucket in range(first, last + 1):
+                self.buckets.setdefault(bucket, []).append(position)
+
+    def nearby(self, start: float, end: float) -> list[dict[str, Any]]:
+        first = int(max(0.0, start - NEAR_TURN) // TIMELINE_BIN)
+        last = int(max(0.0, end + NEAR_TURN) // TIMELINE_BIN)
+        found: set[int] = set()
+        for bucket in range(first, last + 1):
+            found.update(self.buckets.get(bucket, ()))
+        # Overlapping speech puts a word inside two turns at once; keeping the
+        # original order makes which one wins reproducible.
+        return [self.turns[position] for position in sorted(found)]
+
+
+def choose_speaker(start: float, end: float, timeline: SpeakerTimeline) -> tuple[str, float]:
     """Return the best speaker for a word plus how well the turn actually covers it."""
     midpoint = (start + end) / 2
     duration = max(end - start, 0.01)
     best_speaker, best_overlap = "SPEAKER_UNKNOWN", 0.0
     nearest_speaker, nearest_distance = "SPEAKER_UNKNOWN", float("inf")
-    for turn in turns:
+    for turn in timeline.nearby(start, end):
         overlap = max(0.0, min(end, turn["end"]) - max(start, turn["start"]))
         if overlap > best_overlap:
             best_overlap, best_speaker = overlap, turn["speaker"]
@@ -332,17 +469,49 @@ def choose_speaker(start: float, end: float, turns: list[dict[str, Any]]) -> tup
             nearest_distance, nearest_speaker = distance, turn["speaker"]
     if best_overlap > 0:
         return best_speaker, min(1.0, best_overlap / duration)
-    if nearest_distance <= 1.0:
+    if nearest_distance <= NEAR_TURN:
         return nearest_speaker, max(0.15, 0.5 - nearest_distance / 2)
     return "SPEAKER_UNKNOWN", 0.0
 
 
+def smooth_labels(words: list[dict[str, Any]]) -> int:
+    """Absorb single-word speaker flips back into the surrounding turn."""
+    runs: list[list[int]] = []
+    for position, word in enumerate(words):
+        if runs and words[runs[-1][-1]]["label"] == word["label"]:
+            runs[-1].append(position)
+        else:
+            runs.append([position])
+    smoothed = 0
+    for index in range(1, len(runs) - 1):
+        run = runs[index]
+        before, after = runs[index - 1], runs[index + 1]
+        if words[before[-1]]["label"] != words[after[0]]["label"]:
+            continue
+        span = words[run[-1]]["end"] - words[run[0]]["start"]
+        if len(run) > SMOOTH_MAX_WORDS or span > SMOOTH_MAX_SECONDS:
+            continue
+        # Only override a weak assignment: a word squarely inside its own turn
+        # is far more likely to be a genuine interjection.
+        if min(words[position]["speaker_confidence"] for position in run) > 0.5:
+            continue
+        for position in run:
+            words[position]["label"] = words[before[-1]]["label"]
+            words[position]["speaker_confidence"] = round(
+                words[position]["speaker_confidence"] * 0.6, 3
+            )
+        smoothed += len(run)
+    return smoothed
+
+
 def group_words(words: list[dict[str, Any]], turns: list[dict[str, Any]],
                 display: dict[str, str]) -> list[dict[str, Any]]:
+    timeline = SpeakerTimeline(turns)
     for word in words:
-        label, confidence = choose_speaker(word["start"], word["end"], turns)
+        label, confidence = choose_speaker(word["start"], word["end"], timeline)
         word["label"] = label
         word["speaker_confidence"] = round(confidence, 3)
+    smooth_labels(words)
     groups: list[dict[str, Any]] = []
     for word in words:
         last = groups[-1] if groups else None
@@ -410,10 +579,13 @@ def write_outputs(state: SessionState) -> None:
 def finalize_session(state: SessionState) -> None:
     try:
         state.status = "finalizing"
-        while any(chunk.get("status") in {"queued", "transcribing"} for chunk in state.chunks):
+        if any(chunk.get("status") in {"queued", "transcribing"} for chunk in state.chunks):
             state.stage = "Completing live transcript backlog"
             save_state(state)
-            time.sleep(0.25)
+            # The backlog drains on its own; polling it used to rewrite the
+            # manifest four times a second for no one's benefit.
+            while any(chunk.get("status") in {"queued", "transcribing"} for chunk in state.chunks):
+                time.sleep(0.25)
 
         state.stage = "Rebuilding the continuous recording"
         save_state(state)
@@ -432,12 +604,20 @@ def finalize_session(state: SessionState) -> None:
         vocabulary = vocabulary_terms(state)
         state.stage = "Creating the higher-accuracy transcript"
         save_state(state)
-        import mlx.core as mx
 
+        pcm: Any = load_pcm(recording)
+        decode: Any = None
+        language = state.language or live_language(state)
         transcription = transcribe(
-            recording, state.language, FINAL_MODELS[state.final_model],
+            pcm, language, FINAL_MODELS[state.final_model],
             initial_prompt=accuracy.build_prompt(vocabulary["terms"]),
+            # Meetings are mostly pauses, and Whisper fills long silences with
+            # plausible sentences nobody said. This skips ahead instead. It is
+            # deliberately not used on the re-check windows: those are short and
+            # already suspect, and one is chosen precisely because it is a gap.
+            hallucination_silence_threshold=HALLUCINATION_SILENCE,
         )
+        language = transcription.get("language") or language
         (state.directory / "transcription.json").write_text(
             json.dumps(transcription, indent=2, default=json_default) + "\n", encoding="utf-8"
         )
@@ -447,15 +627,21 @@ def finalize_session(state: SessionState) -> None:
         windows: list[dict[str, Any]] = []
         report: list[dict[str, Any]] = []
         if state.self_correct:
-            windows = accuracy.suspect_windows(words, assembled["gaps"])
+            windows = accuracy.suspect_windows(
+                words, assembled["gaps"], assembled["duration"]
+            )
             refine_model = REFINE_MODEL or FINAL_MODELS[state.final_model]
 
             def decode(start: float, end: float, prompt: str | None) -> dict[str, Any]:
-                return transcribe(
-                    recording, state.language, refine_model,
-                    clip_timestamps=[start, end], initial_prompt=prompt,
+                clip = pcm[int(start * TARGET_RATE): int(end * TARGET_RATE)]
+                # The window is decoded on its own, so the language it would
+                # detect from a few seconds of audio is not to be trusted; the
+                # full pass already settled that question.
+                attempt = transcribe(
+                    clip, language, refine_model, initial_prompt=prompt,
                     temperature=0.0, condition_on_previous_text=False,
                 )
+                return shift_timestamps(attempt, start)
 
             def progress(position: int, total: int) -> None:
                 state.stage = f"Re-checking uncertain passage {position} of {total}"
@@ -466,8 +652,10 @@ def finalize_session(state: SessionState) -> None:
             )
             corrections += accuracy.correct_terms(words, vocabulary["terms"])
         state.refinement = report
-        mx.clear_cache()
-        gc.collect()
+        # `decode` closes over the samples, so both names have to go before the
+        # array — hundreds of megabytes on a long meeting — is actually freed.
+        pcm = decode = None
+        release_whisper()
 
         state.stage = "Identifying speakers"
         save_state(state)
@@ -499,8 +687,10 @@ def finalize_session(state: SessionState) -> None:
         save_state(state)
         state.speakers = {}
         display: dict[str, str] = {}
-        for label in sorted({turn["speaker"] for turn in turns}):
-            match = SPEAKERS.identify(embeddings.get(label))
+        labels = sorted({turn["speaker"] for turn in turns})
+        matches = SPEAKERS.assign({label: embeddings.get(label, []) for label in labels})
+        for label in labels:
+            match = matches[label]
             name = match["name"] if match["certainty"] == "confident" else label
             display[label] = name
             state.speakers[label] = {
@@ -555,8 +745,43 @@ async def finish_session(session_id: str) -> dict[str, str]:
     return {"status": "queued"}
 
 
+def session_summary(state: SessionState) -> dict[str, Any]:
+    duration = state.quality.get("duration") or len(state.chunks) * CHUNK_SECONDS
+    named = [
+        speaker.get("name") for speaker in state.speakers.values()
+        if speaker.get("name") and not str(speaker["name"]).startswith("SPEAKER_")
+    ]
+    return {
+        "session_id": state.session_id, "created_at": state.created_at,
+        "status": state.status, "duration": round(duration, 1),
+        "segments": len(state.result or []), "review": len(state.review),
+        "speakers": named, "language": state.language,
+        "title": (state.result[0]["text"][:80] if state.result else ""),
+    }
+
+
+@app.get("/api/sessions")
+def list_sessions() -> dict[str, Any]:
+    """Past meetings, newest first — they were only ever on disk before."""
+    sessions = sorted(
+        SESSIONS.values(), key=lambda state: state.created_at, reverse=True
+    )
+    return {"sessions": [session_summary(state) for state in sessions]}
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str) -> dict[str, str]:
+    state = get_session(session_id)
+    if state.status in {"recording", "queued", "finalizing"}:
+        raise HTTPException(status_code=409, detail="That recording is still in progress")
+    shutil.rmtree(state.directory, ignore_errors=True)
+    SESSIONS.pop(session_id, None)
+    power.release_awake(session_id)
+    return {"status": "deleted"}
+
+
 @app.get("/api/sessions/{session_id}")
-def session_status(session_id: str) -> dict[str, Any]:
+def session_status(session_id: str, since: int = -1) -> dict[str, Any]:
     state = get_session(session_id)
     if state.status != "recording":
         power.release_awake(session_id)
@@ -572,9 +797,12 @@ def session_status(session_id: str) -> dict[str, Any]:
     pending = sum(chunk.get("status") in {"queued", "transcribing"} for chunk in state.chunks)
     ready = sum(chunk.get("status") == "ready" for chunk in state.chunks)
     complete = state.status == "complete"
+    # A long meeting accumulates hundreds of live chunks; re-sending all of them
+    # every second is the bulk of the traffic during recording.
+    chunks = [chunk for chunk in state.chunks if chunk["index"] > since] if since >= 0 else state.chunks
     return {
         "session_id": state.session_id, "status": state.status, "stage": state.stage,
-        "error": state.error, "chunks": state.chunks, "accepted_chunks": len(state.chunks),
+        "error": state.error, "chunks": chunks, "accepted_chunks": len(state.chunks),
         "ready_chunks": ready, "pending_chunks": pending, "result": state.result,
         "final_model": state.final_model, "review": state.review,
         "flags": state.flags, "resolved": len(state.resolved),

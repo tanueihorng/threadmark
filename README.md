@@ -41,7 +41,8 @@ where.
 | **Marks doubt** | Uncertain words are underlined in the app and wrapped in `⟨?⟩` in the export. You can see at a glance which sentences to verify. |
 | **Names the voices** | Speakers are separated automatically. Name them once and Threadmark recognises the same people in future meetings. |
 | **Learns your vocabulary** | Names and internal jargon you supply are fed to the model up front and fuzzy-matched afterwards — deliberately cautious, so it won't rewrite an ordinary word into your terminology. |
-| **Verifies in seconds** | Click any word to hear that exact moment. The transcript follows along as it plays. Fix something and every export rewrites instantly. |
+| **Verifies in seconds** | Click any word to hear that exact moment. The transcript follows along as it plays. Search it, fix something, and every export rewrites instantly. |
+| **Keeps every meeting** | Past recordings are listed in the app — reopen one, finalize a recording that was interrupted, or delete it and its audio for good. |
 | **Survives long meetings** | Audio is committed to disk every six seconds. A crash, a closed browser or a killed server costs you nothing. |
 | **Never phones home** | No account, no cloud, no per-minute pricing, nothing to leak. |
 
@@ -212,6 +213,24 @@ need near-exact matches. `Digibunk → Digibank` fires; `more → MOE` does not.
 **Live chunks overlap for context; stored audio does not.** Sentences crossing a
 chunk boundary survive, and the final recording has no duplicated audio.
 
+**Vocabulary correction works on phrases, not just words.** Neither half of a
+person's name is a near miss for the whole thing, and `trust bridge` is not a
+near miss for `TrustBridge` until the two words are joined. Matching the joined
+phrase catches both, and is *safer* than matching a token, because one wrong
+letter carries less weight across a whole name. Word boundaries are rewritten
+when they were the thing that was wrong.
+
+**One person cannot be two speakers.** Scoring each voice against stored
+profiles independently let two different people in the room both come back as
+the same person — the transcript then credits one participant with someone
+else's words. The strongest pairs claim their names first, so the runner-up gets
+its next-best name, or none at all.
+
+**Re-checking costs a fraction of the first pass, never more.** The budget for
+re-decoding scales with the recording: a fifth of its length, capped at five
+minutes. A three-minute recording used to be allowed 300 seconds of
+re-transcription — longer than the recording itself.
+
 ---
 
 ## Configuration
@@ -238,10 +257,19 @@ Measured on an M2 with 8 GB unified memory:
 
 | | |
 |---|---|
-| Finalization | ≈ 1× real time — a 3-minute recording took 193 s including 10 re-decoded windows and speaker labelling |
 | Live latency | Words appear within a few seconds of being spoken |
 | Disk | ≈ 115 MB of audio per hour |
-| Memory | One model resident at a time — Whisper is released before pyannote loads |
+| Memory | One model resident at a time — Whisper's weights are dropped before pyannote loads |
+
+Four things dominated finalization, and each is now paid once instead of many
+times:
+
+| | |
+|---|---|
+| Re-checking a passage | The audio is read into memory once and sliced. Passing a file path made mlx-whisper decode and analyse the *whole* recording again for every window, so the cost grew with the meeting rather than the passage: **25.7 s → 2.8 s** per 12-second window of a 54-minute recording (Turbo 4-bit) |
+| Aligning words to speakers | Time-bucketed turns instead of comparing every word against every turn: **4.8 s → 0.02 s** on a 54-minute meeting |
+| Saving progress | The transcript is no longer duplicated into the manifest that is rewritten on every update: **1.9 MB → 150 KB** per write, and the backlog wait no longer rewrites it four times a second |
+| Following a recording | The browser asks only for the live segments it has not seen, instead of re-fetching all of them every second |
 
 ---
 
@@ -261,8 +289,6 @@ version control, along with `recordings/`, `input/` and `output/`. **Check
 - Apple Silicon only
 - Processing takes roughly as long as the meeting itself
 - Speaker labels arrive after you stop, not live
-- No way to browse past meetings in the app yet — they're on disk
-- No transcript search
 - No summary written in prose: Threadmark extracts and cites, it doesn't paraphrase
 - No test suite yet
 

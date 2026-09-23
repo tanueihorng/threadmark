@@ -29,6 +29,11 @@ WINDOW_MIN = 4.0
 WINDOW_MAX = 40.0
 MAX_WINDOWS = 14
 MAX_REFINE_SECONDS = 300.0
+# Re-checking should cost a fraction of the first pass, not more than it. A
+# three-minute recording was previously allowed 300 s of re-decoding — longer
+# than the recording — because the budget ignored how much audio there was.
+REFINE_SHARE = 0.2
+MIN_REFINE_SECONDS = 30.0
 
 PROMPT_CHARS = 780
 # Ordinary English words are never "near misses" for a glossary term: correcting
@@ -46,6 +51,12 @@ will with within without would year yes you your
 """.split())
 FUZZY_CUTOFF = 0.86
 ACRONYM_CUTOFF = 0.95
+# A multi-word name is matched on the whole joined phrase, so a single wrong
+# letter matters less than it does in one short token; but an invented phrase is
+# a bigger lie than an invented word, so the bar is still high.
+PHRASE_CUTOFF = 0.88
+PHRASE_MAX_TOKENS = 4
+PHRASE_LENGTH_SLACK = 0.2
 # Two passes this close apart are the same reading, not a disagreement worth surfacing.
 SAME_ENOUGH = 0.92
 
@@ -107,6 +118,117 @@ def build_prompt(terms: Iterable[str], tail: str = "") -> str | None:
     return prompt
 
 
+def _strip(text: str) -> str:
+    return text.strip().strip(".,!?;:\"'()[]")
+
+
+def _record_correction(word: dict[str, Any], stripped: str, replacement: str,
+                       corrections: list[dict[str, Any]]) -> None:
+    corrections.append({
+        "start": word["start"], "end": word["end"],
+        "from": stripped, "to": replacement,
+    })
+    word["text"] = word["text"].replace(stripped, replacement, 1)
+    flags = word.setdefault("flags", [])
+    if "vocabulary" not in flags:
+        flags.append("vocabulary")
+    word.setdefault("corrected_from", stripped)
+
+
+def correct_phrases(words: list[dict[str, Any]], terms: list[str],
+                    corrections: list[dict[str, Any]]) -> set[int]:
+    """Snap runs of words onto known names, rewriting word boundaries if needed.
+
+    Single-token matching cannot see any of this: neither half of a person's
+    name is a near miss for the whole thing, and "trust bridge" is not a near
+    miss for "TrustBridge" until the two words are joined. Matching the joined
+    phrase is also safer than matching a token, because one wrong letter carries
+    less weight across a whole name than across a short word.
+
+    `words` is rewritten in place, since a match can change how many words the
+    passage contains. The returned indices are positions in the rewritten list
+    that later single-token correction must leave alone.
+    """
+    candidates: list[tuple[str, list[str]]] = []
+    for term in terms:
+        tokens = [token for token in term.split() if token]
+        if tokens and len(tokens) <= PHRASE_MAX_TOKENS:
+            candidates.append((normalize(term), tokens))
+    if not candidates:
+        return set()
+
+    claimed: set[int] = set()
+    index = 0
+    while index < len(words):
+        window_keys = [normalize(_strip(word["text"])) for word in words[index:index + PHRASE_MAX_TOKENS]]
+        best: tuple[float, int, list[str]] | None = None
+        for key, tokens in candidates:
+            for size in range(1, len(window_keys) + 1):
+                # One word against one term is the single-token pass's job.
+                if size == 1 and len(tokens) == 1:
+                    continue
+                window = window_keys[:size]
+                if not all(window):
+                    continue
+                joined = "".join(window)
+                if joined == key:
+                    ratio = 1.0
+                else:
+                    # A run made only of ordinary English words is almost
+                    # certainly ordinary English, not a mangled project name.
+                    if all(part in COMMON_WORDS for part in window):
+                        continue
+                    # Without a length guard a high ratio lets an extra word be
+                    # swallowed: "and trust bridge" would become "TrustBridge".
+                    if abs(len(joined) - len(key)) > PHRASE_LENGTH_SLACK * max(len(joined), len(key)):
+                        continue
+                    ratio = difflib.SequenceMatcher(None, joined, key).ratio()
+                    if ratio < PHRASE_CUTOFF:
+                        continue
+                if best is None or ratio > best[0] or (ratio == best[0] and size < best[1]):
+                    best = (ratio, size, tokens)
+        if best is None:
+            index += 1
+            continue
+
+        _, size, tokens = best
+        block = words[index:index + size]
+        surface = [_strip(word["text"]) for word in block]
+        if surface == tokens:
+            claimed.update(range(index, index + size))
+            index += size
+            continue
+
+        if len(tokens) == size:
+            for offset, token in enumerate(tokens):
+                if surface[offset] != token:
+                    _record_correction(block[offset], surface[offset], token, corrections)
+            rewritten = block
+        else:
+            # The word boundaries themselves were wrong, so the passage is
+            # rebuilt with one word per token and the span shared between them.
+            start_at, end_at = block[0]["start"], block[-1]["end"]
+            step = (end_at - start_at) / len(tokens)
+            probability = round(sum(word["probability"] for word in block) / len(block), 4)
+            flags = sorted({flag for word in block for flag in word.get("flags", [])} | {"vocabulary"})
+            corrections.append({
+                "start": start_at, "end": end_at,
+                "from": " ".join(surface), "to": " ".join(tokens),
+            })
+            rewritten = [{
+                "start": round(start_at + position * step, 3),
+                "end": round(start_at + (position + 1) * step, 3),
+                "text": token, "probability": probability,
+                "segment": block[0].get("segment", {}), "flags": list(flags),
+                "corrected_from": " ".join(surface),
+            } for position, token in enumerate(tokens)]
+            words[index:index + size] = rewritten
+
+        claimed.update(range(index, index + len(rewritten)))
+        index += len(rewritten)
+    return claimed
+
+
 def correct_terms(words: list[dict[str, Any]], terms: list[str]) -> list[dict[str, Any]]:
     """Snap near-miss transcriptions onto known names and jargon.
 
@@ -115,31 +237,28 @@ def correct_terms(words: list[dict[str, Any]], terms: list[str]) -> list[dict[st
     The second is worse, so ordinary English words are never rewritten and short
     acronyms have to match almost exactly.
     """
+    corrections: list[dict[str, Any]] = []
+    # Multi-word names first: "way hong" must become "Wei Hong" as a unit rather
+    # than have "hong" fuzzed onto some unrelated single-token term.
+    claimed = correct_phrases(words, terms, corrections)
+
     lookup: dict[str, str] = {}
     for term in terms:
         if " " not in term:
             lookup.setdefault(normalize(term), term)
     keys = list(lookup)
-    corrections: list[dict[str, Any]] = []
 
-    def record(word: dict[str, Any], stripped: str, replacement: str) -> None:
-        corrections.append({
-            "start": word["start"], "end": word["end"],
-            "from": stripped, "to": replacement,
-        })
-        word["text"] = word["text"].replace(stripped, replacement, 1)
-        word.setdefault("flags", []).append("vocabulary")
-        word["corrected_from"] = stripped
-
-    for word in words:
-        stripped = word["text"].strip().strip(".,!?;:\"'()[]")
+    for position, word in enumerate(words):
+        if position in claimed:
+            continue
+        stripped = _strip(word["text"])
         if len(stripped) < 3 or not stripped.isalpha():
             continue
         key = normalize(stripped)
         if key in lookup:
             # Same word, wrong casing: "moe" should be written "MOE".
             if lookup[key] != stripped:
-                record(word, stripped, lookup[key])
+                _record_correction(word, stripped, lookup[key], corrections)
             continue
         if key in COMMON_WORDS:
             continue
@@ -151,7 +270,7 @@ def correct_terms(words: list[dict[str, Any]], terms: list[str]) -> list[dict[st
         acronym = replacement.isupper() and len(replacement) <= 6
         if acronym and ratio < ACRONYM_CUTOFF:
             continue
-        record(word, stripped, replacement)
+        _record_correction(word, stripped, replacement, corrections)
     return corrections
 
 
@@ -222,7 +341,15 @@ def repetition_spans(words: list[dict[str, Any]]) -> list[tuple[float, float]]:
     return spans
 
 
-def suspect_windows(words: list[dict[str, Any]], gaps: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+def refine_budget(duration: float) -> float:
+    """How many seconds of audio the self-correction pass may decode again."""
+    if duration <= 0:
+        return MAX_REFINE_SECONDS
+    return min(MAX_REFINE_SECONDS, max(MIN_REFINE_SECONDS, duration * REFINE_SHARE))
+
+
+def suspect_windows(words: list[dict[str, Any]], gaps: list[dict[str, Any]] | None = None,
+                    duration: float = 0.0) -> list[dict[str, Any]]:
     """Group flagged words into a few short passages worth transcribing again."""
     raw: list[dict[str, Any]] = []
     for word in words:
@@ -264,7 +391,7 @@ def suspect_windows(words: list[dict[str, Any]], gaps: list[dict[str, Any]] | No
 
     scored.sort(key=lambda window: window["score"], reverse=True)
     chosen: list[dict[str, Any]] = []
-    budget = MAX_REFINE_SECONDS
+    budget = refine_budget(duration)
     for window in scored:
         length = window["end"] - window["start"]
         if len(chosen) >= MAX_WINDOWS or length > budget:

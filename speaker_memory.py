@@ -47,22 +47,60 @@ class SpeakerMemory:
     def names(self) -> list[str]:
         return sorted(profile["name"] for profile in self._load()["profiles"])
 
-    def identify(self, embedding: list[float] | None) -> dict[str, Any]:
-        """Best stored match for one voice, with an explicit confidence."""
-        if not embedding:
-            return {"name": None, "similarity": 0.0, "certainty": "unknown"}
-        best_name, best_score = None, 0.0
-        for profile in self._load()["profiles"]:
-            score = _cosine(embedding, profile.get("embedding", []))
-            if score > best_score:
-                best_name, best_score = profile["name"], score
-        if best_score >= MATCH:
+    @staticmethod
+    def _verdict(name: str | None, score: float) -> dict[str, Any]:
+        if score >= MATCH:
             certainty = "confident"
-        elif best_score >= POSSIBLE:
+        elif score >= POSSIBLE:
             certainty = "possible"
         else:
-            best_name, certainty = None, "unknown"
-        return {"name": best_name, "similarity": round(best_score, 3), "certainty": certainty}
+            name, certainty = None, "unknown"
+        return {"name": name, "similarity": round(score, 3), "certainty": certainty}
+
+    def rank(self, embedding: list[float] | None) -> list[tuple[str, float]]:
+        """Every stored voice scored against this one, best first."""
+        if not embedding:
+            return []
+        scored = [
+            (profile["name"], _cosine(embedding, profile.get("embedding", [])))
+            for profile in self._load()["profiles"]
+        ]
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return scored
+
+    def identify(self, embedding: list[float] | None) -> dict[str, Any]:
+        """Best stored match for one voice, with an explicit confidence."""
+        ranked = self.rank(embedding)
+        if not ranked:
+            return {"name": None, "similarity": 0.0, "certainty": "unknown"}
+        return self._verdict(*ranked[0])
+
+    def assign(self, embeddings: dict[str, list[float]]) -> dict[str, dict[str, Any]]:
+        """Match a meeting's voices to stored people, one person per voice.
+
+        Scoring each voice on its own lets two different speakers both come back
+        as the same person — the transcript then credits one participant with
+        someone else's words. Claiming the strongest pairs first makes that
+        impossible: the runner-up gets its next-best name, or none.
+        """
+        pairs = sorted(
+            ((score, label, name)
+             for label, embedding in embeddings.items()
+             for name, score in self.rank(embedding)),
+            key=lambda item: item[0], reverse=True,
+        )
+        taken: set[str] = set()
+        best: dict[str, tuple[str, float]] = {}
+        for score, label, name in pairs:
+            if label in best or name.casefold() in taken:
+                continue
+            best[label] = (name, score)
+            taken.add(name.casefold())
+        return {
+            label: self._verdict(*best[label]) if label in best
+            else {"name": None, "similarity": 0.0, "certainty": "unknown"}
+            for label in embeddings
+        }
 
     def remember(self, name: str, embedding: list[float] | None, session_id: str) -> None:
         """Blend a confirmed voice into the stored profile for that name."""
