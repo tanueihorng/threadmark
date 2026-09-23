@@ -38,6 +38,15 @@ const recoverPanel = $("#recoverPanel");
 const recoverButton = $("#recoverButton");
 const canvas = $("#waveform");
 const canvasContext = canvas.getContext("2d");
+const libraryPanel = $("#libraryPanel");
+const libraryList = $("#libraryList");
+const librarySummary = $("#librarySummary");
+const finder = $("#finder");
+const search = $("#search");
+const searchCount = $("#searchCount");
+const searchPrev = $("#searchPrev");
+const searchNext = $("#searchNext");
+const copyTranscript = $("#copyTranscript");
 
 const CHUNK_SECONDS = 6;
 const LOW_CONFIDENCE = 0.55;
@@ -84,6 +93,10 @@ let quietSince = null;
 let wordSpans = [];
 let reviewFilter = "all";
 let activeTab = "transcript";
+let lastChunkIndex = -1;
+let searchHits = [];
+let searchAt = -1;
+let searchTimer = null;
 
 function setStatus(label, mode = "") {
   statusPill.className = `status-pill ${mode}`.trim();
@@ -100,6 +113,43 @@ function elapsed() {
   return startedAt ? (Date.now() - startedAt) / 1000 : 0;
 }
 
+// --------------------------------------------------------------------------- //
+// Appearance
+// --------------------------------------------------------------------------- //
+
+const themeButtons = document.querySelectorAll("[data-theme-choice]");
+const systemDark = window.matchMedia("(prefers-color-scheme: dark)");
+const waveColors = { live: "", idle: "" };
+
+function readWaveColors() {
+  const style = getComputedStyle(document.documentElement);
+  waveColors.live = style.getPropertyValue("--wave-live").trim();
+  waveColors.idle = style.getPropertyValue("--wave-idle").trim();
+}
+
+function applyTheme(choice) {
+  if (choice === "light" || choice === "dark") document.documentElement.dataset.theme = choice;
+  else delete document.documentElement.dataset.theme;
+  try {
+    if (choice === "light" || choice === "dark") localStorage.setItem("threadmark-theme", choice);
+    else localStorage.removeItem("threadmark-theme");
+  } catch {}
+  themeButtons.forEach((button) => {
+    button.setAttribute("aria-checked", String(button.dataset.themeChoice === choice));
+  });
+  const dark = choice === "dark" || (choice === "auto" && systemDark.matches);
+  document.querySelectorAll('meta[name="theme-color"]').forEach((meta) => {
+    meta.content = dark ? "#0e0c12" : "#f5efe6";
+  });
+  readWaveColors();
+}
+
+themeButtons.forEach((button) => {
+  button.addEventListener("click", () => applyTheme(button.dataset.themeChoice));
+});
+systemDark.addEventListener("change", () => applyTheme(document.documentElement.dataset.theme ?? "auto"));
+applyTheme(document.documentElement.dataset.theme ?? "auto");
+
 function drawWaveform() {
   const ratio = window.devicePixelRatio || 1;
   const width = canvas.clientWidth;
@@ -114,7 +164,7 @@ function drawWaveform() {
     const values = new Uint8Array(analyser.frequencyBinCount);
     analyser.getByteTimeDomainData(values);
     canvasContext.beginPath();
-    canvasContext.strokeStyle = recording ? "#b8ff4f" : "#3b463e";
+    canvasContext.strokeStyle = recording ? waveColors.live : waveColors.idle;
     canvasContext.lineWidth = 2;
     values.forEach((value, index) => {
       const x = (index / (values.length - 1)) * width;
@@ -123,6 +173,13 @@ function drawWaveform() {
     });
     canvasContext.stroke();
     if (recording) checkSilence(values);
+  } else {
+    canvasContext.beginPath();
+    canvasContext.strokeStyle = waveColors.idle;
+    canvasContext.lineWidth = 2;
+    canvasContext.moveTo(0, height / 2);
+    canvasContext.lineTo(width, height / 2);
+    canvasContext.stroke();
   }
   animationFrame = requestAnimationFrame(drawWaveform);
 }
@@ -565,6 +622,173 @@ function renderSpeakers(data) {
   speakerList.replaceChildren(datalist, ...rows);
 }
 
+// --------------------------------------------------------------------------- //
+// Search
+// --------------------------------------------------------------------------- //
+
+function clearSearch() {
+  transcript.querySelectorAll(".hit").forEach((node) => node.classList.remove("hit", "current"));
+  searchHits = [];
+  searchAt = -1;
+  searchCount.textContent = "";
+}
+
+function runSearch() {
+  const query = search.value.trim().toLowerCase();
+  clearSearch();
+  if (query.length < 2) return;
+  transcript.querySelectorAll(".utterance.final").forEach((row) => {
+    const spans = [...row.querySelectorAll(".word")];
+    if (!spans.length) {
+      // A hand-corrected passage keeps no per-word spans, so it matches whole.
+      const paragraph = row.querySelector("p");
+      if (paragraph?.textContent.toLowerCase().includes(query)) {
+        paragraph.classList.add("hit");
+        searchHits.push(paragraph);
+      }
+      return;
+    }
+    // Matching across the joined text finds phrases that span several words.
+    let haystack = "";
+    const bounds = spans.map((span) => {
+      const from = haystack.length;
+      haystack += span.textContent.toLowerCase();
+      return [from, haystack.length];
+    });
+    let at = haystack.indexOf(query);
+    while (at !== -1) {
+      const covered = spans.filter((_, index) => bounds[index][0] < at + query.length && bounds[index][1] > at);
+      covered.forEach((span) => span.classList.add("hit"));
+      if (covered.length) searchHits.push(covered[0]);
+      at = haystack.indexOf(query, at + Math.max(1, query.length));
+    }
+  });
+  if (!searchHits.length) {
+    searchCount.textContent = "no matches";
+    return;
+  }
+  searchAt = -1;
+  stepSearch(1);
+}
+
+function stepSearch(direction) {
+  if (!searchHits.length) return;
+  searchHits[searchAt]?.classList.remove("current");
+  searchAt = (searchAt + direction + searchHits.length) % searchHits.length;
+  const node = searchHits[searchAt];
+  node.classList.add("current");
+  node.scrollIntoView({ block: "center", behavior: "smooth" });
+  searchCount.textContent = `${searchAt + 1} / ${searchHits.length}`;
+}
+
+function transcriptText(data) {
+  return (data.result ?? [])
+    .map((group) => `[${clock(group.start)}] ${group.speaker}: ${group.text}`)
+    .join("\n");
+}
+
+// --------------------------------------------------------------------------- //
+// Past meetings
+// --------------------------------------------------------------------------- //
+
+function describeMeeting(meeting) {
+  const when = new Date(meeting.created_at);
+  const stamp = Number.isNaN(when.valueOf())
+    ? meeting.created_at
+    : when.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  const parts = [stamp, clock(meeting.duration)];
+  if (meeting.speakers?.length) parts.push(meeting.speakers.join(", "));
+  if (meeting.status !== "complete") parts.push(meeting.status);
+  else if (meeting.review) parts.push(`${meeting.review} to review`);
+  return parts.join(" · ");
+}
+
+async function renderLibrary() {
+  let meetings = [];
+  try {
+    meetings = (await (await fetch("/api/sessions")).json()).sessions ?? [];
+  } catch (error) {
+    librarySummary.textContent = "could not be read";
+    return;
+  }
+  librarySummary.textContent = meetings.length
+    ? `${meetings.length} on this Mac`
+    : "nothing recorded yet";
+  if (!meetings.length) {
+    libraryList.replaceChildren(emptyNote("Meetings you record appear here."));
+    return;
+  }
+  libraryList.replaceChildren(...meetings.map((meeting) => {
+    const row = document.createElement("article");
+    row.className = `library-item${meeting.session_id === sessionId ? " current" : ""}`;
+    const body = document.createElement("div");
+    const title = document.createElement("b");
+    title.textContent = meeting.title || "Untitled meeting";
+    const meta = document.createElement("small");
+    meta.textContent = describeMeeting(meeting);
+    body.append(title, meta);
+
+    const open = document.createElement("button");
+    open.textContent = meeting.status === "complete" ? "Open" : "Resume";
+    open.addEventListener("click", () => openMeeting(meeting));
+
+    const remove = document.createElement("button");
+    remove.className = "danger";
+    remove.textContent = "Delete";
+    remove.title = "Delete this recording and its audio from disk";
+    remove.addEventListener("click", async () => {
+      if (!window.confirm(`Delete this recording permanently?\n\n${meeting.title || meeting.session_id}`)) return;
+      remove.disabled = true;
+      try {
+        const response = await fetch(`/api/sessions/${meeting.session_id}`, { method: "DELETE" });
+        if (!response.ok) throw new Error((await response.json()).detail || "Could not delete that recording");
+        if (meeting.session_id === sessionId) {
+          sessionId = null;
+          localStorage.removeItem("threadmark-session");
+        }
+        await renderLibrary();
+      } catch (error) {
+        showError(error.message);
+        remove.disabled = false;
+      }
+    });
+
+    row.append(body, open, remove);
+    return row;
+  }));
+}
+
+async function openMeeting(meeting) {
+  if (recording) return;
+  sessionId = meeting.session_id;
+  renderedChunks = new Set();
+  lastChunkIndex = -1;
+  transcript.replaceChildren();
+  player.removeAttribute("src");
+  player.classList.add("hidden");
+  try {
+    const data = await readStatus();
+    if (!data) return;
+    if (data.status === "complete") {
+      renderResult(data);
+      setStatus("Ready");
+      recordState.textContent = data.review?.length
+        ? `Opened · ${data.review.length} passage${data.review.length === 1 ? "" : "s"} flagged for review`
+        : "Opened a finished meeting";
+      footerState.textContent = "Viewing a past meeting";
+    } else {
+      renderLiveStatus(data);
+      recoverPanel.classList.remove("hidden");
+      setStatus("Recovered");
+      recordState.textContent = "This recording was never finalized";
+    }
+    libraryPanel.open = false;
+    await renderLibrary();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
 function selectTab(name) {
   activeTab = name;
   const panels = { transcript, review: reviewList, speakers: speakerList };
@@ -598,6 +822,8 @@ function renderResult(data) {
   wordSpans = [];
   transcript.replaceChildren(...(data.result ?? []).map(renderSegment));
   legend.classList.remove("hidden");
+  finder.classList.toggle("hidden", !(data.result ?? []).length);
+  if (search.value.trim()) runSearch(); else clearSearch();
   renderQuality(data);
   renderReview(data);
   renderSpeakers(data);
@@ -622,9 +848,12 @@ async function refreshComplete() {
 // Session flow
 // --------------------------------------------------------------------------- //
 
-async function readStatus() {
+async function readStatus({ incremental = false } = {}) {
   if (!sessionId) return null;
-  const response = await fetch(`/api/sessions/${sessionId}`);
+  // While recording, only the chunks we have not seen are worth re-sending; an
+  // hour-long meeting otherwise ships hundreds of them every single second.
+  const query = incremental ? `?since=${lastChunkIndex}` : "";
+  const response = await fetch(`/api/sessions/${sessionId}${query}`);
   if (response.status === 404) {
     localStorage.removeItem("threadmark-session");
     sessionId = null;
@@ -642,6 +871,12 @@ function renderLiveStatus(data) {
       appendLiveUtterance(item);
     }
   });
+  // A chunk is only settled once it is no longer queued, so the cursor stops at
+  // the first one still being transcribed rather than skipping past it.
+  for (const item of data.chunks) {
+    if (["queued", "transcribing"].includes(item.status)) break;
+    lastChunkIndex = Math.max(lastChunkIndex, item.index);
+  }
   renderWarnings(data.host);
   backlog.textContent = data.pending_chunks
     ? `${data.pending_chunks} segment${data.pending_chunks === 1 ? "" : "s"} in transcription queue`
@@ -652,7 +887,7 @@ function renderLiveStatus(data) {
 async function pollLive() {
   window.clearTimeout(pollTimer);
   try {
-    const data = await readStatus();
+    const data = await readStatus({ incremental: true });
     if (data) renderLiveStatus(data);
   } catch (error) {
     backlog.textContent = "Server reconnecting… audio capture continues";
@@ -696,7 +931,8 @@ async function startRecording() {
     localStorage.setItem("threadmark-session", sessionId);
     localStorage.setItem("threadmark-vocabulary", vocabularyInput.value);
     startedAt = Date.now(); chunkIndex = 0; recording = true; pcmParts = []; pcmLength = 0;
-    uploadQueue = []; renderedChunks = new Set(); transcript.replaceChildren();
+    uploadQueue = []; renderedChunks = new Set(); lastChunkIndex = -1; transcript.replaceChildren();
+    finder.classList.add("hidden"); clearSearch(); libraryPanel.open = false;
     finalizeStatus.classList.add("hidden"); resultActions.classList.add("hidden");
     recoverPanel.classList.add("hidden"); tabs.classList.add("hidden");
     legend.classList.add("hidden"); jumpLive.classList.add("hidden");
@@ -772,8 +1008,9 @@ async function stopRecording() {
 
 async function pollFinalization() {
   try {
-    const data = await readStatus();
+    const data = await readStatus({ incremental: true });
     if (!data) throw new Error("Recording session was not found");
+    data.chunks.forEach((item) => { lastChunkIndex = Math.max(lastChunkIndex, item.index); });
     finalizeStage.textContent = data.stage;
     renderWarnings(data.host);
     backlog.textContent = data.pending_chunks ? `${data.pending_chunks} live segments remaining` : "All audio safely stored";
@@ -787,6 +1024,7 @@ async function pollFinalization() {
       releaseControls();
       footerState.textContent = "Final transcript ready";
       localStorage.removeItem("threadmark-session");
+      renderLibrary();
       return;
     }
     if (data.status === "error") throw new Error(data.error || "Finalization failed");
@@ -813,6 +1051,8 @@ async function restoreSession() {
     const health = await (await fetch("/api/health")).json();
     renderWarnings(health);
   } catch (error) { /* the recorder still works without a health report */ }
+
+  renderLibrary();
 
   if (!sessionId) return;
   try {
@@ -875,6 +1115,42 @@ recoverButton.addEventListener("click", async () => {
   recoverPanel.classList.add("hidden"); recordButton.disabled = true;
   try { await beginFinalization(); } catch (error) { showError(error.message); }
 });
+search.addEventListener("input", () => {
+  window.clearTimeout(searchTimer);
+  searchTimer = window.setTimeout(runSearch, 120);
+});
+search.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { event.preventDefault(); stepSearch(event.shiftKey ? -1 : 1); }
+  if (event.key === "Escape") { search.value = ""; clearSearch(); search.blur(); }
+});
+searchNext.addEventListener("click", () => stepSearch(1));
+searchPrev.addEventListener("click", () => stepSearch(-1));
+copyTranscript.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(transcriptText(latest ?? {}));
+    copyTranscript.textContent = "Copied";
+  } catch (error) {
+    copyTranscript.textContent = "Copy failed";
+  }
+  window.setTimeout(() => { copyTranscript.textContent = "Copy"; }, 1800);
+});
+
+document.addEventListener("keydown", (event) => {
+  const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName);
+  if (event.key === "/" && !typing && !finder.classList.contains("hidden")) {
+    event.preventDefault();
+    search.focus();
+    search.select();
+    return;
+  }
+  if (event.key === " " && !typing && player.src) {
+    event.preventDefault();
+    player.paused ? player.play().catch(() => {}) : player.pause();
+    return;
+  }
+  if (event.key === "Escape" && !typing) clearSearch();
+});
+
 window.addEventListener("beforeunload", (event) => {
   if (recording) { event.preventDefault(); event.returnValue = ""; }
 });
