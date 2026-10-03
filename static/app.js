@@ -142,6 +142,7 @@ function applyTheme(choice) {
     meta.content = dark ? "#0e0c12" : "#f5efe6";
   });
   readWaveColors();
+  redrawWaveform();
 }
 
 themeButtons.forEach((button) => {
@@ -150,7 +151,19 @@ themeButtons.forEach((button) => {
 systemDark.addEventListener("change", () => applyTheme(document.documentElement.dataset.theme ?? "auto"));
 applyTheme(document.documentElement.dataset.theme ?? "auto");
 
-function drawWaveform() {
+// While live, the waveform redraws at ~30 fps; idle, it draws a flat line once
+// and stops, so the page costs nothing between meetings.
+const WAVE_FRAME_MS = 33;
+let waveValues = null;
+let lastWaveFrame = 0;
+
+function drawWaveform(now = performance.now()) {
+  animationFrame = null;
+  if (analyser) {
+    animationFrame = requestAnimationFrame(drawWaveform);
+    if (now - lastWaveFrame < WAVE_FRAME_MS) return;
+    lastWaveFrame = now;
+  }
   const ratio = window.devicePixelRatio || 1;
   const width = canvas.clientWidth;
   const height = canvas.clientHeight;
@@ -160,29 +173,37 @@ function drawWaveform() {
     canvasContext.setTransform(ratio, 0, 0, ratio, 0, 0);
   }
   canvasContext.clearRect(0, 0, width, height);
+  canvasContext.beginPath();
+  canvasContext.lineWidth = 2;
   if (analyser) {
-    const values = new Uint8Array(analyser.frequencyBinCount);
+    if (waveValues?.length !== analyser.frequencyBinCount) waveValues = new Uint8Array(analyser.frequencyBinCount);
+    const values = waveValues;
     analyser.getByteTimeDomainData(values);
-    canvasContext.beginPath();
     canvasContext.strokeStyle = recording ? waveColors.live : waveColors.idle;
-    canvasContext.lineWidth = 2;
-    values.forEach((value, index) => {
-      const x = (index / (values.length - 1)) * width;
-      const y = (value / 255) * height;
-      index ? canvasContext.lineTo(x, y) : canvasContext.moveTo(x, y);
-    });
+    const step = width / (values.length - 1);
+    canvasContext.moveTo(0, (values[0] / 255) * height);
+    for (let index = 1; index < values.length; index += 1) {
+      canvasContext.lineTo(index * step, (values[index] / 255) * height);
+    }
     canvasContext.stroke();
     if (recording) checkSilence(values);
   } else {
-    canvasContext.beginPath();
     canvasContext.strokeStyle = waveColors.idle;
-    canvasContext.lineWidth = 2;
     canvasContext.moveTo(0, height / 2);
     canvasContext.lineTo(width, height / 2);
     canvasContext.stroke();
   }
-  animationFrame = requestAnimationFrame(drawWaveform);
 }
+
+function redrawWaveform() {
+  if (animationFrame === null) animationFrame = requestAnimationFrame(drawWaveform);
+}
+
+function setBusy(busy) {
+  document.documentElement.classList.toggle("busy", busy);
+}
+
+window.addEventListener("resize", redrawWaveform);
 
 function checkSilence(values) {
   let sum = 0;
@@ -948,6 +969,7 @@ async function startRecording() {
     captureNode.port.onmessage = (event) => receiveSamples(event.data);
     sourceNode.connect(analyser); sourceNode.connect(captureNode); captureNode.connect(silentGain).connect(audioContext.destination);
     watchMicrophone();
+    setBusy(true); redrawWaveform();
 
     timer = window.setInterval(() => { timeDisplay.textContent = clock(elapsed()); }, 250);
     recordButton.classList.add("active"); recordButton.disabled = true;
@@ -978,7 +1000,7 @@ async function stopCapture() {
   if (pcmLength) enqueueChunk(takeSamples(pcmLength));
   stream?.getTracks().forEach((track) => track.stop());
   sourceNode?.disconnect(); captureNode?.disconnect(); silentGain?.disconnect();
-  await audioContext?.close(); analyser = null;
+  await audioContext?.close(); analyser = null; redrawWaveform();
   await waitForUploads();
 }
 
@@ -1002,6 +1024,7 @@ async function stopRecording() {
     recordState.textContent = "Recording safely stored · finalizing locally";
     await beginFinalization();
   } catch (error) {
+    setBusy(false);
     showError(error.message);
   }
 }
@@ -1016,6 +1039,7 @@ async function pollFinalization() {
     backlog.textContent = data.pending_chunks ? `${data.pending_chunks} live segments remaining` : "All audio safely stored";
     setStatus(data.status === "complete" ? "Ready" : "Finalizing");
     if (data.status === "complete") {
+      setBusy(false);
       renderResult(data);
       finalizeStatus.classList.add("hidden");
       recordState.textContent = data.review?.length
@@ -1030,6 +1054,7 @@ async function pollFinalization() {
     if (data.status === "error") throw new Error(data.error || "Finalization failed");
     window.setTimeout(pollFinalization, 2500);
   } catch (error) {
+    setBusy(false);
     finalizeStatus.classList.add("hidden");
     releaseControls();
     showError(error.message);
@@ -1063,6 +1088,7 @@ async function restoreSession() {
       recordButton.disabled = true;
       [languageSelect, modelSelect, vocabularyInput, speakerCount, selfCorrect]
         .forEach((control) => { control.disabled = true; });
+      setBusy(true);
       pollFinalization();
       return;
     }
@@ -1135,8 +1161,64 @@ copyTranscript.addEventListener("click", async () => {
   window.setTimeout(() => { copyTranscript.textContent = "Copy"; }, 1800);
 });
 
+// --------------------------------------------------------------------------- //
+// Collapsible panels
+// --------------------------------------------------------------------------- //
+
+const shell = $(".shell");
+const toggleLeft = $("#toggleLeft");
+const toggleRight = $("#toggleRight");
+const toggleFocus = $("#toggleFocus");
+const miniTime = $("#miniTime");
+const miniButtons = [[$("#miniRecord"), recordButton], [$("#miniFlag"), flagButton], [$("#miniStop"), stopButton]];
+
+function setPanels(left, right) {
+  shell.classList.toggle("hide-left", !left);
+  shell.classList.toggle("hide-right", !right);
+  toggleLeft.setAttribute("aria-pressed", String(left));
+  toggleRight.setAttribute("aria-pressed", String(right));
+  toggleFocus.setAttribute("aria-pressed", String(!left && !right));
+  if (right) redrawWaveform();
+  if (stickToBottom) transcript.scrollTop = transcript.scrollHeight;
+}
+
+function panelsShown() {
+  return [!shell.classList.contains("hide-left"), !shell.classList.contains("hide-right")];
+}
+
+function toggleFocusMode() {
+  const [left, right] = panelsShown();
+  const focused = !left && !right;
+  setPanels(focused, focused);
+}
+
+toggleLeft.addEventListener("click", () => { const [left, right] = panelsShown(); setPanels(!left, right); });
+toggleRight.addEventListener("click", () => { const [left, right] = panelsShown(); setPanels(left, !right); });
+toggleFocus.addEventListener("click", toggleFocusMode);
+
+// The mini recorder mirrors the real controls rather than duplicating their logic.
+miniButtons.forEach(([mini, real]) => {
+  mini.addEventListener("click", () => real.click());
+  const sync = () => { mini.disabled = real.disabled; };
+  new MutationObserver(sync).observe(real, { attributes: true, attributeFilter: ["disabled"] });
+  sync();
+});
+new MutationObserver(() => { miniTime.textContent = timeDisplay.textContent; })
+  .observe(timeDisplay, { childList: true, characterData: true, subtree: true });
+
+// Every visit opens on the transcript alone; side panels appear only when asked for.
+setPanels(false, false);
+
 document.addEventListener("keydown", (event) => {
   const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName);
+  if (!typing && !event.metaKey && !event.ctrlKey && !event.altKey && ["[", "]", "\\"].includes(event.key)) {
+    event.preventDefault();
+    const [left, right] = panelsShown();
+    if (event.key === "[") setPanels(!left, right);
+    else if (event.key === "]") setPanels(left, !right);
+    else toggleFocusMode();
+    return;
+  }
   if (event.key === "/" && !typing && !finder.classList.contains("hidden")) {
     event.preventDefault();
     search.focus();

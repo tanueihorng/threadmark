@@ -183,6 +183,13 @@ button { cursor: pointer; }
 }
 .glass-strong { background: var(--glass-strong); }
 
+/* While recording or finalizing, transcription needs the Mac's CPU and GPU more
+   than the background does: freeze the colour field and drop live blur, which
+   otherwise recomputes behind every panel on each waveform frame. */
+.busy .blob { animation-play-state: paused; will-change: auto; }
+.busy .glass, .busy .glass-strong, .busy .jump-live { backdrop-filter: none; -webkit-backdrop-filter: none; }
+.busy .glass { background: var(--glass-strong); }
+
 /* --- Layout --------------------------------------------------------------- */
 .shell {
   position: relative; z-index: 1;
@@ -243,6 +250,40 @@ button { cursor: pointer; }
 .theme-switch button[aria-checked="true"] { background: var(--pill); color: var(--text); box-shadow: 0 2px 8px var(--inset), inset 0 1px 0 var(--shine); }
 .privacy-note { display: flex; align-items: center; gap: 8px; padding: 0 8px; color: var(--muted); font-size: 12px; }
 .privacy-note svg { width: 14px; height: 14px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; }
+
+/* --- Collapsible panels ------------------------------------------------- */
+.shell.hide-left .sidebar, .shell.hide-right .rail { display: none; }
+.shell.hide-left { grid-template-columns: minmax(0, 1fr) 360px; }
+.shell.hide-right { grid-template-columns: 264px minmax(0, 1fr); }
+.shell.hide-left.hide-right { grid-template-columns: minmax(0, 1fr); }
+.shell.hide-left.hide-right .transcript-panel { padding-top: 24px; }
+.shell.hide-left.hide-right h1 { font-size: clamp(1.8rem, 2.6vw, 2.4rem); }
+
+.head-tools { flex: none; display: flex; align-items: center; gap: 10px; }
+.panel-toggles { display: flex; gap: 2px; padding: 3px; border-radius: 99px; background: var(--chip); }
+.panel-toggle {
+  width: 32px; height: 32px; display: grid; place-items: center; border: 0; border-radius: 99px;
+  background: transparent; color: var(--muted); transition: background-color .2s ease, color .2s ease;
+}
+.panel-toggle:hover { color: var(--text); }
+.panel-toggle[aria-pressed="true"] { background: var(--pill); color: var(--text); box-shadow: 0 2px 8px var(--inset), inset 0 1px 0 var(--shine); }
+.panel-toggle svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.panel-toggle svg .fill { fill: currentColor; stroke: none; opacity: .35; }
+
+/* A compact recorder so recording can be controlled with the recorder panel hidden. */
+.mini-recorder { display: none; align-items: center; gap: 6px; padding: 3px 3px 3px 14px; border-radius: 99px; background: var(--chip); }
+.shell.hide-right .mini-recorder { display: flex; }
+.mini-time { font: 500 14px var(--mono); font-variant-numeric: tabular-nums; color: var(--text); margin-right: 4px; }
+.mini-button {
+  width: 32px; height: 32px; display: grid; place-items: center; border: 0; border-radius: 99px;
+  background: var(--pill); color: var(--text);
+}
+.mini-button:disabled { opacity: .4; cursor: default; }
+.mini-button svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linejoin: round; }
+.mini-button.solid { background: var(--text); color: var(--base); }
+.mini-button.solid svg { fill: currentColor; stroke: none; }
+.mini-button.record span { width: 12px; height: 12px; border-radius: 50%; background: var(--accent); }
+.mini-button.record:disabled { display: none; }
 
 /* --- Transcript header ---------------------------------------------------- */
 .transcript-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
@@ -325,9 +366,9 @@ h1 em { font-style: italic; }
 @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
 .utterance time { padding-top: 4px; color: var(--muted); font: 12px/1.6 var(--mono); }
 .utterance-body strong { display: block; margin-bottom: 4px; font-size: 13px; font-weight: 600; }
-.utterance-body p { margin: 0; color: var(--text-soft); font: 400 clamp(19px, 1.6vw, 23px)/1.45 var(--serif); }
+.utterance-body p { margin: 0; color: var(--text); font: 400 clamp(17px, 1.3vw, 19px)/1.65 var(--sans); letter-spacing: 0; }
 .utterance-body em { margin-left: 8px; padding: 2px 8px; border-radius: 99px; background: var(--warn-soft); color: var(--warn); font: 500 11px var(--sans); font-style: normal; }
-.utterance.provisional .utterance-body p { font-style: italic; opacity: .6; }
+.utterance.provisional .utterance-body p { color: var(--text-soft); }
 .utterance.uncertain time { color: var(--warn); }
 .utterance.highlight { background: var(--accent-soft); }
 .utterance-body p.seekable { cursor: pointer; }
@@ -489,6 +530,8 @@ time.seek { cursor: pointer; text-decoration: underline dotted; text-underline-o
   .library-list { grid-auto-flow: column; grid-auto-columns: minmax(220px, 1fr); overflow-x: auto; }
   .sidebar-foot { flex-direction: row; align-items: center; margin-left: auto; }
   .transcript-panel { min-height: 80vh; }
+  .shell.hide-left { grid-template-columns: minmax(0, 1fr) 340px; }
+  .shell.hide-right, .shell.hide-left.hide-right { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (max-width: 820px) {
@@ -496,6 +539,8 @@ time.seek { cursor: pointer; text-decoration: underline dotted; text-underline-o
   .sidebar-foot { margin-left: 0; flex-wrap: wrap; }
   .rail { order: -1; overflow: visible; }
   .transcript-panel { padding: 24px 16px; min-height: 70vh; }
+  .shell.hide-left, .shell.hide-right, .shell.hide-left.hide-right { grid-template-columns: 1fr; }
+  .transcript-head { flex-wrap: wrap; }
   .utterance, .review-item { grid-template-columns: 1fr; gap: 4px; }
   .legend span { margin-left: 0; }
   .settings-grid { grid-template-columns: 1fr; }

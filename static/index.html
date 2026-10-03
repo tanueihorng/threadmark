@@ -21,7 +21,7 @@
       <i class="blob b1"></i><i class="blob b2"></i><i class="blob b3"></i><i class="blob b4"></i>
     </div>
 
-    <div class="shell">
+    <div class="shell hide-left hide-right">
       <aside class="sidebar glass">
         <div class="brand">
           <svg class="brand-mark" viewBox="0 0 18 26" aria-hidden="true"><rect x="2" y="2" width="14" height="22" rx="7"/><line x1="9" y1="8" x2="9" y2="18"/></svg>
@@ -61,7 +61,30 @@
             <div class="eyebrow" id="backlog">Listening begins when you press record</div>
             <h1 id="transcript-title">Capture the <em>room.</em></h1>
           </div>
-          <div class="status-pill" id="statusPill"><span></span><b>Idle</b></div>
+          <div class="head-tools">
+            <div class="mini-recorder" id="miniRecorder" aria-label="Recorder controls">
+              <span class="mini-time" id="miniTime">00:00:00</span>
+              <button class="mini-button record" id="miniRecord" title="Start recording" aria-label="Start recording"><span></span></button>
+              <button class="mini-button" id="miniFlag" disabled title="Mark this moment for review later" aria-label="Flag moment">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 21V4h11l-2 4 2 4H5"/></svg>
+              </button>
+              <button class="mini-button solid" id="miniStop" disabled title="Stop recording" aria-label="Stop recording">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+              </button>
+            </div>
+            <div class="status-pill" id="statusPill"><span></span><b>Idle</b></div>
+            <div class="panel-toggles" role="group" aria-label="Layout">
+              <button class="panel-toggle" id="toggleLeft" aria-pressed="false" title="Show or hide past meetings  ( [ )">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/><path class="fill" d="M4 5h4v14H4z"/></svg>
+              </button>
+              <button class="panel-toggle" id="toggleFocus" aria-pressed="true" title="Focus on the transcript  ( \ )">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+              </button>
+              <button class="panel-toggle" id="toggleRight" aria-pressed="false" title="Show or hide the recorder panel  ( ] )">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M15 4v16"/><path class="fill" d="M16 5h4v14h-4z"/></svg>
+              </button>
+            </div>
+          </div>
         </div>
 
         <div class="tabs hidden" id="tabs" role="tablist">
